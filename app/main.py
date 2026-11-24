@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
 
+from . import orientation as ori_mod
 from . import solver
 
 MAX_FRAMES = 80
@@ -34,7 +36,7 @@ SESSION: dict = {}
 
 # ---------------------------------------------------------------- 工具
 
-def _read_png(data: bytes) -> np.ndarray:
+def _open_png(data: bytes) -> Image.Image:
     try:
         img = Image.open(io.BytesIO(data))
         img.load()
@@ -42,7 +44,26 @@ def _read_png(data: bytes) -> np.ndarray:
         raise HTTPException(400, f"无法解码 PNG：{exc}") from exc
     if img.format != "PNG":
         raise HTTPException(400, "只接受 PNG 帧")
-    return np.asarray(img.convert("L"), dtype=np.uint8)
+    return img
+
+
+def _read_png_record(data: bytes):
+    """读取一帧 PNG，返回 (转正后灰度数组, EXIF方向, 存储宽, 存储高)。
+
+    /api/frame 仍直接回传原始字节，因此这里的转正只作用于求解/校验，
+    不会改动 SESSION["png"] 中保存的上传字节。
+    """
+    img = _open_png(data)
+    o = ori_mod.get_orientation(img)
+    stored_w, stored_h = img.size
+    img = ori_mod.transpose_to_oriented(img)
+    gray = np.asarray(img.convert("L"), dtype=np.uint8)
+    return gray, o, int(stored_w), int(stored_h)
+
+
+def _read_png(data: bytes) -> np.ndarray:
+    """向后兼容的简写：只返回按 EXIF 转正后的灰度数组。"""
+    return _read_png_record(data)[0]
 
 
 def _parse_boxes(payload) -> list[list[list[float]]]:
@@ -72,36 +93,65 @@ def _parse_boxes(payload) -> list[list[list[float]]]:
 def _load_session(png_blobs: list[bytes], boxes_payload) -> dict:
     if not 1 <= len(png_blobs) <= MAX_FRAMES:
         raise HTTPException(400, f"帧数须在 1..{MAX_FRAMES} 之间，收到 {len(png_blobs)}")
-    grays = [_read_png(b) for b in png_blobs]
+
+    # 1) 解码并按每帧 EXIF Orientation 转正；同时保留存储方向尺寸
+    records = [_read_png_record(b) for b in png_blobs]
+    grays = [r[0] for r in records]
+    orientations = [r[1] for r in records]
+    stored_sizes = [(r[2], r[3]) for r in records]
+
+    # 2) 必留框仍是“文件存储方向”的半开像素坐标：先按原框校验
+    frames_boxes_stored = _parse_boxes(boxes_payload)
+    if len(frames_boxes_stored) != len(png_blobs):
+        raise HTTPException(
+            400,
+            f"必留框帧数 {len(frames_boxes_stored)} 与 PNG 帧数 {len(png_blobs)} 不一致")
+    for i, boxes in enumerate(frames_boxes_stored):
+        sw, sh = stored_sizes[i]
+        for b in boxes:
+            x0, y0, x1, y1 = b
+            if not (0 <= x0 < x1 <= sw and 0 <= y0 < y1 <= sh):
+                raise HTTPException(
+                    400,
+                    f"第 {i} 帧必留框 {b} 超出文件存储方向画面 {sw}x{sh} 或非法")
+
+    # 3) 按各帧 EXIF 方向把框换算到转正坐标系
+    frames_boxes = [
+        [ori_mod.storage_box_to_oriented(b, stored_sizes[i][0],
+                                         stored_sizes[i][1], orientations[i])
+         for b in boxes]
+        for i, boxes in enumerate(frames_boxes_stored)
+    ]
+
+    # 4) 整段素材按“转正后的尺寸”校验一致性与规格
     H, W = grays[0].shape
     for i, g in enumerate(grays):
         if g.shape != (H, W):
-            raise HTTPException(400, f"第 {i} 帧尺寸 {g.shape[1]}x{g.shape[0]} 与首帧 {W}x{H} 不一致")
+            raise HTTPException(
+                400,
+                f"第 {i} 帧按 EXIF {orientations[i]} 转正后尺寸 "
+                f"{g.shape[1]}x{g.shape[0]} 与首帧转正尺寸 {W}x{H} 不一致")
     if W > MAX_SIDE or H > MAX_SIDE:
-        raise HTTPException(400, f"帧边长至多为 {MAX_SIDE} 像素，收到 {W}x{H}")
+        raise HTTPException(400, f"转正后帧边长至多为 {MAX_SIDE} 像素，收到 {W}x{H}")
     if H % 16 != 0:
-        raise HTTPException(400, f"帧高须为 16 的倍数，收到 {H}")
+        raise HTTPException(400, f"转正后帧高须为 16 的倍数，收到 {H}")
     cw = solver.crop_width(H)
     if cw > W:
-        raise HTTPException(400, f"原图宽 {W} 放不下 9:16 竖屏窗口（需 ≥ {cw}）")
-
-    frames_boxes = _parse_boxes(boxes_payload)
-    if len(frames_boxes) != len(grays):
-        raise HTTPException(400, f"必留框帧数 {len(frames_boxes)} 与 PNG 帧数 {len(grays)} 不一致")
-    for i, boxes in enumerate(frames_boxes):
-        for b in boxes:
-            x0, y0, x1, y1 = b
-            if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
-                raise HTTPException(400, f"第 {i} 帧必留框 {b} 超出画面或非法")
+        raise HTTPException(400, f"转正后原图宽 {W} 放不下 9:16 竖屏窗口（需 ≥ {cw}）")
 
     energies = [solver.window_energies(g) for g in grays]
     feasibles = [solver.feasible_mask(b, W, H) for b in frames_boxes]
     X = W - cw + 1
     session = {
         "n": len(grays), "w": W, "h": H, "cw": cw, "x_max": X - 1,
-        "png": png_blobs, "boxes": frames_boxes,
+        "png": png_blobs,
+        "boxes": frames_boxes,
+        "boxes_stored": frames_boxes_stored,
+        "orientations": orientations,
+        "stored_sizes": stored_sizes,
         "energies": energies, "feasibles": feasibles,
     }
+    # 全部校验/计算成功后才替换全局会话：上传被拒时旧素材、锁定与预览不受影响
     SESSION.clear()
     SESSION.update(session)
     return session
@@ -115,7 +165,13 @@ def _meta(session: dict) -> dict:
     return {
         "n": session["n"], "w": session["w"], "h": session["h"],
         "cw": session["cw"], "x_max": session["x_max"],
-        "boxes": session["boxes"], "feasible": feas,
+        # 以下 boxes 为换算到转正方向后的框，供网页叠加对齐
+        "boxes": session["boxes"],
+        "feasible": feas,
+        # 每帧 EXIF 方向及文件存储方向尺寸，供前端把原始字节手动转正
+        "orientations": session.get("orientations", [1] * session["n"]),
+        "stored_sizes": session.get(
+            "stored_sizes", [(session["w"], session["h"])] * session["n"]),
     }
 
 
@@ -135,11 +191,13 @@ async def api_upload(frames: list[UploadFile] = File(...),
 
 @app.post("/api/load_sample")
 async def api_load_sample(name: str = "a"):
-    if name not in ("a", "b"):
-        raise HTTPException(400, "未知样片")
+    # 内置 a/b/c/d；也允许载入 sample_<安全名称> 下的其他演示素材
+    # （如外部测试夹具），但绝不允许路径分隔符或 ".."。
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name or ""):
+        raise HTTPException(400, "非法样片名")
     d = SAMPLE_DIR / f"sample_{name}"
     if not d.is_dir():
-        raise HTTPException(404, f"样片目录不存在：{d}")
+        raise HTTPException(404, f"样片不存在：{name}")
     paths = sorted(d.glob("frame_*.png"))
     boxes_path = d / "boxes.json"
     if not paths or not boxes_path.is_file():

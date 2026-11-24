@@ -16,8 +16,10 @@
       <button id="btnUpload">上传</button>
       <button id="btnSampleA">载入样片 A（可解）</button>
       <button id="btnSampleB">载入样片 B（不可解演示）</button>
+      <button id="btnSampleC">载入样片 C（混合 EXIF 朝向）</button>
       <button id="btnSolve" disabled>求解</button>
     </div>
+    <div class="hint">必留框坐标按各 PNG <b>文件存储方向</b>填写（半开像素区间）；服务端校验原框后按每帧 EXIF 方向自动转正。</div>
     <div id="status" class="status"></div>
   </section>
 
@@ -27,6 +29,7 @@
       <input type="range" id="slider" min="0" value="0">
       <button id="btnNext">下一帧 →</button>
       <span id="frameLabel"></span>
+      <span id="oriLabel" class="ori-badge"></span>
       <button id="btnLock">锁定本帧位置</button>
       <button id="btnUnlock">解锁本帧</button>
     </div>
